@@ -5,7 +5,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
-import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -19,10 +18,10 @@ os.environ.setdefault(
     "Chrome/124.0.0.0 Safari/537.36",
 )
 
-from pybaseball import batting_stats_range, pitching_stats, pitching_stats_range
+from pybaseball import statcast_pitcher
 
 try:
-    # Set a browser-like user agent to reduce 403s from FanGraphs endpoints.
+    # Set a browser-like user agent to reduce 403s from pybaseball endpoints.
     from pybaseball.datahelpers import general as _pb_general
 
     _pb_general.set_user_agent(
@@ -32,7 +31,7 @@ try:
 except Exception:
     pass
 
-from config import CACHE_DIR, FG_LOCAL_DIR, PARK_FACTORS_PATH, RECENT_STARTS_WINDOW
+from config import CACHE_DIR, PARK_FACTORS_PATH
 
 
 def _parse_date(date_str: str) -> dt.date:
@@ -48,6 +47,8 @@ def _resolve_probable_pitchers_statsapi(target_date: dt.date) -> pd.DataFrame:
         "date": date_str,
         "hydrate": "probablePitcher,teams",
     }
+
+    team_map = _team_id_to_abbr_map()
 
     resp = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
@@ -67,16 +68,8 @@ def _resolve_probable_pitchers_statsapi(target_date: dt.date) -> pd.DataFrame:
         home_team = home["team"]
         away_team = away["team"]
 
-        home_abbr = (
-            home_team.get("abbreviation")
-            or home_team.get("teamCode")
-            or home_team.get("triCode")
-        )
-        away_abbr = (
-            away_team.get("abbreviation")
-            or away_team.get("teamCode")
-            or away_team.get("triCode")
-        )
+        home_abbr = team_map.get(home_team.get("id"))
+        away_abbr = team_map.get(away_team.get("id"))
 
         home_prob = home.get("probablePitcher")
         away_prob = away.get("probablePitcher")
@@ -88,7 +81,8 @@ def _resolve_probable_pitchers_statsapi(target_date: dt.date) -> pd.DataFrame:
                     "pitcher_id": home_prob.get("id"),
                     "team": home_abbr,
                     "opp": away_abbr,
-                    "hand": home_prob.get("pitchHand", {}).get("code"),
+                    "hand": home_prob.get("pitchHand", {}).get("code")
+                    or _pitcher_hand(home_prob.get("id")),
                     "home": True,
                     "game_date": game_date,
                 }
@@ -101,13 +95,21 @@ def _resolve_probable_pitchers_statsapi(target_date: dt.date) -> pd.DataFrame:
                     "pitcher_id": away_prob.get("id"),
                     "team": away_abbr,
                     "opp": home_abbr,
-                    "hand": away_prob.get("pitchHand", {}).get("code"),
+                    "hand": away_prob.get("pitchHand", {}).get("code")
+                    or _pitcher_hand(away_prob.get("id")),
                     "home": False,
                     "game_date": game_date,
                 }
             )
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if not df.empty and df["team"].isna().all():
+        raise RuntimeError(
+            "Probable starters found but team abbreviations are missing. "
+            "Check MLB Stats API team mapping response."
+        )
+    return df
+
 
 def _resolve_probable_pitchers(target_date: dt.date) -> pd.DataFrame:
     # Primary: MLB Stats API
@@ -127,7 +129,6 @@ def _resolve_probable_pitchers(target_date: dt.date) -> pd.DataFrame:
         pass
 
     return pd.DataFrame()
-
 
 
 def _resolve_probable_pitchers_pybaseball(target_date: dt.date) -> pd.DataFrame:
@@ -186,130 +187,96 @@ def _resolve_probable_pitchers_pybaseball(target_date: dt.date) -> pd.DataFrame:
     )
 
 
-    date_str = target_date.strftime("%Y-%m-%d")
-    url = "https://statsapi.mlb.com/api/v1/schedule"
-    params = {"sportId": 1, "date": date_str, "hydrate": "probablePitcher"}
-    resp = requests.get(url, params=params, timeout=15)
-    resp.raise_for_status()
-    payload = resp.json()
-    dates = payload.get("dates", [])
-    games = dates[0].get("games", []) if dates else []
-    rows = []
-    for game in games:
-        game_date = _parse_date(game.get("officialDate", date_str))
-        home_team = game["teams"]["home"]["team"]
-        away_team = game["teams"]["away"]["team"]
-        home_abbr = home_team.get("abbreviation") or home_team.get("teamCode") or home_team.get("triCode")
-        away_abbr = away_team.get("abbreviation") or away_team.get("teamCode") or away_team.get("triCode")
-        home_prob = game["teams"]["home"].get("probablePitcher") or {}
-        away_prob = game["teams"]["away"].get("probablePitcher") or {}
-        if home_prob.get("fullName"):
-            rows.append(
-                {
-                    "pitcher": home_prob.get("fullName"),
-                    "pitcher_id": home_prob.get("id"),
-                    "team": home_abbr,
-                    "opp": away_abbr,
-                    "hand": None,
-                    "home": True,
-                    "game_date": game_date,
-                }
-            )
-        if away_prob.get("fullName"):
-            rows.append(
-                {
-                    "pitcher": away_prob.get("fullName"),
-                    "pitcher_id": away_prob.get("id"),
-                    "team": away_abbr,
-                    "opp": home_abbr,
-                    "hand": None,
-                    "home": False,
-                    "game_date": game_date,
-                }
-            )
-    return pd.DataFrame(rows)
-
-
 def fetch_probable_starters(target_date: dt.date) -> pd.DataFrame:
     """Return probable starters for a given date, normalized to one row per pitcher."""
     df = _resolve_probable_pitchers(target_date)
     return df.reset_index(drop=True)
 
 
-def fetch_season_stats(year: int, local_dir: Optional[Path] = None) -> pd.DataFrame:
-    """Season-to-date stats from FanGraphs."""
-    local = _read_local_csv(local_dir, "season_pitching.csv")
-    if local is not None:
-        return local
-    cache_path = _cache_path(f"season_{year}.csv")
+def _team_id_to_abbr_map() -> Dict[int, str]:
+    cache_path = _cache_path("mlb_teams_map.csv")
     cached = _read_cache(cache_path)
-    if cached is not None:
-        return cached
-    stats = _retry_pybaseball(pitching_stats, year, qual=0)
-    stats = stats.rename(columns={"IDfg": "player_id"})
-    _write_cache(cache_path, stats)
-    return stats
+    if cached is not None and {"id", "abbreviation"}.issubset(cached.columns):
+        return {
+            int(row["id"]): row["abbreviation"]
+            for _, row in cached.iterrows()
+            if pd.notna(row.get("id")) and pd.notna(row.get("abbreviation"))
+        }
+
+    url = "https://statsapi.mlb.com/api/v1/teams"
+    params = {"sportId": 1}
+    resp = requests.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    payload = resp.json()
+    teams = payload.get("teams", [])
+
+    rows = []
+    for team in teams:
+        team_id = team.get("id")
+        abbr = team.get("abbreviation")
+        if team_id is None or not abbr:
+            continue
+        rows.append({"id": team_id, "abbreviation": abbr})
+
+    team_df = pd.DataFrame(rows)
+    _write_cache(cache_path, team_df)
+    return {int(row["id"]): row["abbreviation"] for _, row in team_df.iterrows()}
 
 
-def fetch_recent_stats(
-    start_date: dt.date, end_date: dt.date, local_dir: Optional[Path] = None
+def _pitcher_hand(pitcher_id: int) -> Optional[str]:
+    if pitcher_id is None:
+        return None
+    cache_path = _cache_path("mlb_pitcher_handedness.csv")
+    cached = _read_cache(cache_path)
+    if cached is not None and {"pitcher_id", "hand"}.issubset(cached.columns):
+        match = cached[cached["pitcher_id"] == pitcher_id]
+        if not match.empty:
+            hand = match.iloc[0].get("hand")
+            return hand if pd.notna(hand) else None
+
+    url = f"https://statsapi.mlb.com/api/v1/people/{pitcher_id}"
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        payload = resp.json()
+        people = payload.get("people", [])
+        if not people:
+            return None
+        hand = people[0].get("pitchHand", {}).get("code")
+        if not hand:
+            return None
+    except Exception:
+        return None
+
+    new_row = pd.DataFrame([{"pitcher_id": pitcher_id, "hand": hand}])
+    if cached is not None and {"pitcher_id", "hand"}.issubset(cached.columns):
+        updated = pd.concat([cached, new_row], ignore_index=True)
+        updated = updated.drop_duplicates(subset=["pitcher_id"], keep="last")
+    else:
+        updated = new_row
+    _write_cache(cache_path, updated)
+    return hand
+
+
+def _statcast_cache_path(pitcher_id: int, start_date: dt.date, end_date: dt.date) -> Path:
+    filename = f"statcast_pitcher_{pitcher_id}_{start_date:%Y-%m-%d}_{end_date:%Y-%m-%d}.csv"
+    return _cache_path(filename)
+
+
+def fetch_statcast_window(
+    pitcher_id: int, start_date: dt.date, end_date: dt.date
 ) -> pd.DataFrame:
-    """Rolling window stats using FanGraphs range endpoint."""
-    local = _read_local_csv(local_dir, "recent_pitching.csv")
-    if local is not None:
-        return local
-    cache_path = _cache_path(f"recent_{start_date:%Y-%m-%d}_{end_date:%Y-%m-%d}.csv")
+    cache_path = _statcast_cache_path(pitcher_id, start_date, end_date)
     cached = _read_cache(cache_path)
     if cached is not None:
         return cached
-    stats = _retry_pybaseball(
-        pitching_stats_range,
+    data = statcast_pitcher(
         start_date.strftime("%Y-%m-%d"),
         end_date.strftime("%Y-%m-%d"),
-        qual=0,
+        pitcher_id,
     )
-    stats = stats.rename(columns={"IDfg": "player_id"})
-    _write_cache(cache_path, stats)
-    return stats
-
-
-def fetch_opponent_offense(
-    start_date: dt.date, end_date: dt.date, local_dir: Optional[Path] = None
-) -> pd.DataFrame:
-    """Opponent offense stats over a recent range (defaults to last 30 days)."""
-    local = _read_local_csv(local_dir, "offense.csv")
-    if local is not None:
-        return local
-    cache_path = _cache_path(f"offense_{start_date:%Y-%m-%d}_{end_date:%Y-%m-%d}.csv")
-    cached = _read_cache(cache_path)
-    if cached is not None:
-        return cached
-    bats = _retry_pybaseball(
-        batting_stats_range, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
-    )
-    bats = bats.rename(columns={"Team": "team"})
-    team_cols = [
-        "team",
-        "OPS",
-        "wRC+",
-        "K%",
-        "BB%",
-    ]
-    bats = bats[team_cols]
-    _write_cache(cache_path, bats)
-    return bats
-
-
-def _retry_pybaseball(func, *args, **kwargs) -> pd.DataFrame:
-    """Retry wrapper to handle transient FanGraphs 403s."""
-    last_exc = None
-    for attempt in range(3):
-        try:
-            return func(*args, **kwargs)
-        except Exception as exc:  # noqa: BLE001 - best-effort retry for upstream failures.
-            last_exc = exc
-            time.sleep(2 ** attempt)
-    raise last_exc
+    _write_cache(cache_path, data)
+    return data
 
 
 def load_park_factors() -> Dict[str, Dict[str, float]]:
@@ -320,67 +287,80 @@ def load_park_factors() -> Dict[str, Dict[str, float]]:
 def attach_pitcher_features(
     starters: pd.DataFrame, target_date: dt.date, local_dir: Optional[Path] = None
 ) -> pd.DataFrame:
-    """Join season stats, recent stats, opponent context, and park factors."""
-    season_stats = fetch_season_stats(target_date.year, local_dir=local_dir)
-    recent_start = target_date - dt.timedelta(days=30)
-    recent_stats = fetch_recent_stats(recent_start, target_date, local_dir=local_dir)
-    opp_offense = fetch_opponent_offense(recent_start, target_date, local_dir=local_dir)
+    """Join recent Statcast pitcher features and park factors."""
+    recent_end = target_date - dt.timedelta(days=1)
+    recent_start = recent_end - dt.timedelta(days=29)
     park_factors = load_park_factors()
-
-    def pick_row(df: pd.DataFrame, player_name: str) -> Optional[pd.Series]:
-        matches = df[df["Name"] == player_name]
-        if matches.empty:
-            return None
-        return matches.iloc[0]
 
     features = []
     for _, row in starters.iterrows():
-        season_row = pick_row(season_stats, row["pitcher"])
-        recent_row = pick_row(recent_stats, row["pitcher"])
-        opp_row = opp_offense[opp_offense["team"] == row["opp"]]
-        opp = opp_row.iloc[0] if not opp_row.empty else None
+        pitcher_id = row.get("pitcher_id")
+        statcast = pd.DataFrame()
+        if pd.notna(pitcher_id):
+            try:
+                statcast = fetch_statcast_window(int(pitcher_id), recent_start, recent_end)
+            except Exception:
+                statcast = pd.DataFrame()
         park = park_factors.get(row["team"], {"run": 1.0, "hr": 1.0})
 
-        def val(src: Optional[pd.Series], key: str) -> Optional[float]:
-            if src is None:
-                return None
-            return src.get(key)
+        pa_recent = None
+        k_pct_recent = None
+        bb_pct_recent = None
+        k_bb_pct_recent = None
+        avg_velo_recent = None
+        avg_ev_recent = None
+
+        if not statcast.empty:
+            pa_rows = statcast[statcast["events"].notna()]
+            pa_recent = int(len(pa_rows))
+            if pa_recent > 0:
+                k_events = pa_rows["events"].str.contains("strikeout", na=False)
+                bb_events = pa_rows["events"].isin(["walk", "intent_walk"])
+                k_pct_recent = float(k_events.sum()) / pa_recent
+                bb_pct_recent = float(bb_events.sum()) / pa_recent
+                k_bb_pct_recent = k_pct_recent - bb_pct_recent
+
+            if "release_speed" in statcast.columns:
+                avg_velo_recent = statcast["release_speed"].mean()
+            if "launch_speed" in statcast.columns:
+                avg_ev_recent = statcast["launch_speed"].mean()
 
         features.append(
             {
                 **row.to_dict(),
-                "siera": val(season_row, "SIERA"),
-                "xfip": val(season_row, "xFIP"),
-                "k_bb_pct": val(season_row, "K-BB%"),
-                "csw_pct": val(season_row, "CSW%"),
-                "whiff_pct": val(recent_row, "SwStr%"),
-                "gb_pct": val(season_row, "GB%"),
-                "barrel_pa_pct": val(season_row, "Barrel%"),
-                "opp_wrc_plus_vs_hand": opp["wRC+"] if opp is not None else None,
-                "opp_k_pct_vs_hand": opp["K%"] if opp is not None else None,
+                "pa_recent": pa_recent,
+                "k_pct_recent": k_pct_recent,
+                "bb_pct_recent": bb_pct_recent,
+                "k_bb_pct_recent": k_bb_pct_recent,
+                "avg_velo_recent": avg_velo_recent,
+                "avg_ev_recent": avg_ev_recent,
                 "park_run_factor": park.get("run", 1.0),
                 "park_hr_factor": park.get("hr", 1.0),
             }
         )
 
     df = pd.DataFrame(features)
+    core_cols = [
+        "k_bb_pct_recent",
+        "k_pct_recent",
+        "bb_pct_recent",
+        "avg_velo_recent",
+        "avg_ev_recent",
+        "park_run_factor",
+    ]
+    for col in core_cols:
+        if col not in df.columns:
+            df[col] = pd.NA
+    present_list = []
+    present_counts = []
+    for _, row in df.iterrows():
+        present_cols = [col for col in core_cols if pd.notna(row.get(col))]
+        present_list.append(",".join(present_cols))
+        present_counts.append(len(present_cols))
+    df["features_present"] = pd.Series(present_counts, index=df.index, dtype="int64")
+    df["features_missing"] = len(core_cols) - df["features_present"]
+    df["features_present_list"] = present_list
     return df
-
-
-def attach_minimal_features(starters: pd.DataFrame) -> pd.DataFrame:
-    """Attach only park factors when FanGraphs is unavailable."""
-    park_factors = load_park_factors()
-    features = []
-    for _, row in starters.iterrows():
-        park = park_factors.get(row["team"], {"run": 1.0, "hr": 1.0})
-        features.append(
-            {
-                **row.to_dict(),
-                "park_run_factor": park.get("run", 1.0),
-                "park_hr_factor": park.get("hr", 1.0),
-            }
-        )
-    return pd.DataFrame(features)
 
 
 def build_feature_table(
@@ -388,12 +368,7 @@ def build_feature_table(
 ) -> pd.DataFrame:
     target_date = _parse_date(date_str)
     starters = fetch_probable_starters(target_date)
-    if skip_fangraphs:
-        enriched = attach_minimal_features(starters)
-    else:
-        enriched = attach_pitcher_features(
-            starters, target_date, local_dir=local_fangraphs_dir
-        )
+    enriched = attach_pitcher_features(starters, target_date, local_dir=local_fangraphs_dir)
     return enriched
 
 
@@ -417,21 +392,3 @@ def _write_cache(path: Path, df: pd.DataFrame) -> None:
     except Exception:
         # Cache is best-effort; ignore failures.
         return
-
-
-def _read_local_csv(local_dir: Optional[Path], filename: str) -> Optional[pd.DataFrame]:
-    if local_dir is None:
-        return None
-    path = local_dir / filename
-    if not path.exists():
-        return None
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        return None
-    # Normalize common FanGraphs fields if present.
-    if "IDfg" in df.columns:
-        df = df.rename(columns={"IDfg": "player_id"})
-    if "Team" in df.columns:
-        df = df.rename(columns={"Team": "team"})
-    return df
