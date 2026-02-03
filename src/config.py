@@ -22,8 +22,8 @@ FG_LOCAL_DIR = DEFAULT_OUTPUT_DIR / "fg_manual"
 
 # Feature weights for the heuristic stream score.
 HEURISTIC_WEIGHTS = {
-    "k_bb_pct_recent": 0.35,
-    "k_pct_recent": 0.15,
+    "k_bb_pct_recent": 0.40,
+    "k_pct_recent": 0.10,
     "bb_pct_recent": -0.2,
     "avg_velo_recent": 0.1,
     "avg_ev_recent": -0.1,

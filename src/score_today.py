@@ -8,7 +8,7 @@ from pathlib import Path
 
 from config import DEFAULT_OUTPUT_DIR, FG_LOCAL_DIR
 from data_pull import build_feature_table
-from model import score_pitchers
+from model import add_reasons, score_pitchers
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +56,7 @@ def main() -> None:
         print(features.isna().sum().sort_values(ascending=False).head(15))
 
     scored = score_pitchers(features)
+    scored = add_reasons(scored)
     scored.to_csv(out_path, index=False)
     print(f"Wrote {len(scored)} rows to {out_path}")
 

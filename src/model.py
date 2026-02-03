@@ -35,6 +35,44 @@ def score_pitchers(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_reasons(df: pd.DataFrame, top_n: int = 3) -> pd.DataFrame:
+    """Add a human-readable explanation of top positive/negative contributions."""
+    contributions = {}
+    for feature, weight in HEURISTIC_WEIGHTS.items():
+        if feature not in df.columns:
+            continue
+        feature_series = df[feature]
+        filled = feature_series.fillna(feature_series.mean())
+        if filled.isnull().all():
+            filled = filled.fillna(0)
+        z = _zscore(filled)
+        contributions[feature] = weight * z
+
+    def format_side(items):
+        return ", ".join([f"{feat} ({val:+.2f})" for feat, val in items])
+
+    reasons = []
+    for idx in df.index:
+        pos = []
+        neg = []
+        for feature, series in contributions.items():
+            val = float(series.loc[idx])
+            if val > 0:
+                pos.append((feature, val))
+            elif val < 0:
+                neg.append((feature, val))
+        pos = sorted(pos, key=lambda x: abs(x[1]), reverse=True)[:top_n]
+        neg = sorted(neg, key=lambda x: abs(x[1]), reverse=True)[:top_n]
+        parts = []
+        if pos:
+            parts.append(f"+ {format_side(pos)}")
+        if neg:
+            parts.append(f"- {format_side(neg)}")
+        reasons.append(" | ".join(parts))
+    df["reasons"] = reasons
+    return df
+
+
 def assign_tier(score: float) -> str:
     if score >= START_THRESHOLD:
         return "Start"
